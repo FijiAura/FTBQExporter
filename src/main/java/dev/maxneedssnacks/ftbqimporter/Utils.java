@@ -1,353 +1,227 @@
-package dev.maxneedssnacks.ftbqimporter;
+package dev.maxneedssnacks.ftbqexporter;
 
-import com.feed_the_beast.ftblib.lib.config.EnumTristate;
-import com.feed_the_beast.ftbquests.item.FTBQuestsItems;
+import com.feed_the_beast.ftblib.lib.data.ForgePlayer;
+import com.feed_the_beast.ftblib.lib.data.ForgeTeam;
+import com.feed_the_beast.ftblib.lib.data.Universe;
+import com.feed_the_beast.ftblib.lib.io.DataWriter;
+import com.feed_the_beast.ftblib.lib.util.NBTConverter;
+import com.feed_the_beast.ftbquests.quest.Chapter;
 import com.feed_the_beast.ftbquests.quest.Quest;
+import com.feed_the_beast.ftbquests.quest.ServerQuestFile;
+import com.feed_the_beast.ftbquests.quest.loot.LootCrate;
 import com.feed_the_beast.ftbquests.quest.loot.RewardTable;
 import com.feed_the_beast.ftbquests.quest.loot.WeightedReward;
-import com.feed_the_beast.ftbquests.quest.reward.*;
-import com.feed_the_beast.ftbquests.quest.task.*;
-import com.latmod.mods.itemfilters.api.IItemFilter;
-import com.latmod.mods.itemfilters.api.ItemFiltersAPI;
-import com.latmod.mods.itemfilters.filters.NBTMatchingMode;
-import com.latmod.mods.itemfilters.filters.OreDictionaryFilter;
-import com.latmod.mods.itemfilters.item.ItemFilter;
-import com.latmod.mods.itemfilters.item.ItemFiltersItems;
-import com.latmod.mods.itemfilters.item.ItemMissing;
+import com.feed_the_beast.ftbquests.quest.reward.ItemReward;
+import com.feed_the_beast.ftbquests.quest.reward.Reward;
+import com.feed_the_beast.ftbquests.quest.task.Task;
+import com.feed_the_beast.ftbquests.util.ServerQuestData;
+import com.google.gson.JsonArray;
+import com.google.gson.JsonObject;
+import net.minecraft.command.CommandBase;
+import net.minecraft.command.CommandException;
+import net.minecraft.command.ICommandSender;
+import net.minecraft.command.WrongUsageException;
 import net.minecraft.item.ItemStack;
-import net.minecraft.nbt.NBTBase;
 import net.minecraft.nbt.NBTTagCompound;
-import net.minecraft.nbt.NBTTagString;
-import net.minecraft.util.NonNullList;
-import net.minecraft.util.ResourceLocation;
-import net.minecraftforge.fluids.Fluid;
-import net.minecraftforge.fluids.FluidRegistry;
-import net.minecraftforge.oredict.OreDictionary;
+import net.minecraft.server.MinecraftServer;
+import net.minecraft.util.text.TextComponentString;
+import net.minecraftforge.fml.common.Loader;
 
-import java.util.*;
-import java.util.function.BiFunction;
+import java.io.File;
+import java.util.Arrays;
+import java.util.List;
 
-public final class Utils {
+public class CommandExport extends CommandBase {
 
-    public static final String WARNING_TAG = "has_warning";
-
-    public static final Map<String, BiFunction<NBTTagCompound, Quest, Collection<Task>>> taskConverters = new TreeMap<>();
-    public static final Map<String, BiFunction<NBTTagCompound, Quest, Collection<Reward>>> rewardConverters = new TreeMap<>();
-
-    @SafeVarargs
-    public static <T> BiFunction<NBTTagCompound, Quest, Collection<T>> empty(T... donotusethis) {
-        return (nbt, q) -> {
-            FTBQImporter.LOGGER.warn("The quest {} contains a {} with an unrecognised type {} which has been skipped!",
-                    q.title, donotusethis.getClass().getComponentType().getSimpleName(), nbt.getString("taskID"));
-            q.getTags().add(WARNING_TAG);
-            return Collections.emptySet();
-        };
+    @Override
+    public String getName() {
+        return "ftbq_export";
     }
 
-    // task converters
-    static {
-        final BiFunction<NBTTagCompound, Quest, Collection<Task>> ITEM = (nbt, q) -> {
-            if (q.getTags().contains("has_item_task") && q.orTasks) {
-                FTBQImporter.LOGGER.warn("The quest {} contains more than one item task but is using OR task logic!" +
-                        " Since support for this is limited in FTB Quests, any other item tasks have been skipped!", q.title);
-                q.getTags().add(WARNING_TAG);
-                return Collections.emptySet();
-            }
+    @Override
+    public String getUsage(ICommandSender sender) {
+        return "/ftbq_export <quests|progress> [-c, -d]";
+    }
 
-            Collection<Task> tasks = new HashSet<>();
+    @Override
+    public void execute(MinecraftServer server, ICommandSender sender, String[] args) throws CommandException {
+        if (args.length == 0) {
+            throw new WrongUsageException(getUsage(sender));
+        }
 
-            boolean ignoreNBT = nbt.getBoolean("ignoreNBT");
-            boolean consume = nbt.getBoolean("consume");
+        switch (args[0].toLowerCase()) {
+            case "q":
+            case "quests":
+                exportQuests(server, sender, Arrays.asList(args).subList(1, args.length));
+                break;
+            case "p":
+            case "progress":
+                exportProgress(server, sender, Arrays.asList(args).subList(1, args.length));
+                break;
+            default:
+                throw new WrongUsageException(getUsage(sender));
+        }
+    }
 
-            for (NBTBase taskItemBase : nbt.getTagList("requiredItems", 10)) {
-                ItemStack item = Utils.nbtItem((NBTTagCompound) taskItemBase, true);
-                if (!item.isEmpty()) {
-                    ItemTask t = new ItemTask(q);
-                    t.items.add(item);
-                    t.count = item.getCount();
-                    t.consumeItems = consume ? EnumTristate.TRUE : EnumTristate.DEFAULT;
+    public void exportQuests(MinecraftServer server, ICommandSender sender, List<String> flags) throws CommandException {
+        sender.sendMessage(new TextComponentString("Exporting Quests..."));
 
-                    if (!item.isStackable()) {
-                        t.ignoreDamage = !item.getHasSubtypes();
-                    }
+        ServerQuestFile f = ServerQuestFile.INSTANCE;
+        JsonObject defaultQuestsJson = new JsonObject();
+        JsonArray questLinesArray = new JsonArray();
 
-                    if (ignoreNBT) {
-                        t.nbtMode = NBTMatchingMode.IGNORE;
-                    }
+        // Convert FTB Quests data to Better Questing format
+        for (Chapter chapter : f.chapters) {
+            JsonObject chapterJson = new JsonObject();
+            chapterJson.addProperty("name", chapter.title);
+            chapterJson.addProperty("desc", String.join("\n", chapter.subtitle));
 
-                    tasks.add(t);
+            JsonObject chapterProperties = new JsonObject();
+            chapterProperties.add("betterquesting", chapterJson);
+
+            JsonObject chapterNbt = new JsonObject();
+            chapterNbt.add("properties", chapterProperties);
+
+            JsonArray questsArray = new JsonArray();
+            for (Quest quest : chapter.quests) {
+                JsonObject questJson = new JsonObject();
+                questJson.addProperty("name", quest.title);
+                questJson.addProperty("desc", String.join("\n", quest.description));
+
+                JsonArray tasksArray = new JsonArray();
+                for (Task task : quest.tasks) {
+                    JsonObject taskJson = new JsonObject();
+                    // Add task details to taskJson
+                    tasksArray.add(taskJson);
                 }
+                questJson.add("tasks", tasksArray);
+
+                JsonArray rewardsArray = new JsonArray();
+                for (Reward reward : quest.rewards) {
+                    JsonObject rewardJson = new JsonObject();
+                    // Add reward details to rewardJson
+                    rewardsArray.add(rewardJson);
+                }
+                questJson.add("rewards", rewardsArray);
+
+                questsArray.add(questJson);
             }
+            chapterNbt.add("quests", questsArray);
 
-            q.getTags().add("has_item_task");
+            questLinesArray.add(chapterNbt);
+        }
 
-            if (tasks.isEmpty()) {
-                FTBQImporter.LOGGER.warn("Item task for quest {} is empty!", q.title);
-                q.getTags().add(WARNING_TAG);
-            }
+        defaultQuestsJson.add("questLines", questLinesArray);
 
-            return tasks;
-        };
+        // Export loot
+        LootExporter lootExporter = new LootExporter(f);
+        JsonObject lootJson = lootExporter.exportLoot();
+        defaultQuestsJson.add("loot", lootJson);
 
-        taskConverters.put("bq_standard:crafting", ITEM);
-        taskConverters.put("bq_standard:retrieval", ITEM);
+        // Save to JSON file
+        DataWriter.save(new File(Loader.instance().getConfigDir(), "exported_quests.json"), defaultQuestsJson);
 
-        taskConverters.put("bq_standard:checkbox", (nbt, q) -> Collections.singleton(new CheckmarkTask(q)));
+        sender.sendMessage(new TextComponentString("Finished exporting Quests!"));
+    }
 
-        taskConverters.put("bq_standard:xp", (nbt, q) -> {
-            XPTask task = new XPTask(q);
-            task.value = nbt.getLong("amount");
-            task.points = !nbt.getBoolean("isLevels");
-            if (!nbt.getBoolean("consume")) {
-                FTBQImporter.LOGGER.warn("The quest {} contains an XP task that does not consume experience!" +
-                        " Since this is not supported in FTB Quests, the created task will consume XP!", q.title);
-                q.getTags().add(WARNING_TAG);
-            }
-            return Collections.singleton(task);
-        });
+    public void exportProgress(MinecraftServer server, ICommandSender sender, List<String> flags) throws CommandException {
+        sender.sendMessage(new TextComponentString("Exporting Progress..."));
 
-        taskConverters.put("bq_standard:hunt", (nbt, q) -> {
-            KillTask task = new KillTask(q);
-            task.entity = new ResourceLocation(nbt.getString("target"));
-            task.value = nbt.getLong("required");
-            return Collections.singleton(task);
-        });
+        final Universe u = Universe.get();
+        JsonObject questProgressJson = new JsonObject();
+        JsonArray questProgressArray = new JsonArray();
 
-        taskConverters.put("bq_standard:location", (nbt, q) -> {
-            int x = nbt.getInteger("posX");
-            int y = nbt.getInteger("posY");
-            int z = nbt.getInteger("posZ");
-            int dimension = nbt.getInteger("dimension");
-            int range = nbt.getInteger("range");
-            if (range == -1) {
-                DimensionTask task = new DimensionTask(q);
-                task.dimension = dimension;
-                return Collections.singleton(task);
-            } else {
-                LocationTask task = new LocationTask(q);
-                task.dimension = dimension;
-                task.x = x - range / 2;
-                task.y = y - range / 2;
-                task.z = z - range / 2;
-                task.w = range;
-                task.h = range;
-                task.d = range;
-                return Collections.singleton(task);
-            }
-        });
+        // Convert FTB Quests progress data to Better Questing format
+        for (ForgeTeam team : u.getTeams()) {
+            ServerQuestData teamData = ServerQuestData.get(team);
+            for (ForgePlayer player : team.getMembers()) {
+                JsonObject playerProgress = new JsonObject();
 
-        taskConverters.put("bq_standard:advancement", (nbt, q) -> {
-            AdvancementTask task = new AdvancementTask(q);
-            task.advancement = nbt.getString("advancement_id");
-            task.criterion = "";
-            return Collections.singleton(task);
-        });
-
-        taskConverters.put("bq_standard:trigger", (nbt, q) -> {
-            String trigger = nbt.getString("trigger");
-            AdvancementTask task = new AdvancementTask(q);
-            task.advancement = trigger;
-            task.criterion = nbt.getString("conditions");
-            FTBQImporter.LOGGER.warn("The quest {} contains a trigger task. Please note that FTB Quests only supports" +
-                    " advancement triggers, so this may not work as intended!", q.title);
-            q.getTags().add(WARNING_TAG);
-            return Collections.singleton(task);
-        });
-
-        taskConverters.put("bq_rf:rf_charge", (nbt, q) -> {
-            ForgeEnergyTask task = new ForgeEnergyTask(q);
-            task.value = nbt.getLong("rf");
-            return Collections.singleton(task);
-        });
-
-        taskConverters.put("bq_standard:fluid", (nbt, q) -> {
-            boolean consume = nbt.getBoolean("consume");
-            Collection<Task> tasks = new HashSet<>();
-
-            if (consume) {
-                boolean ignoreNBT = nbt.getBoolean("ignoreNBT");
-                for (NBTBase fluidNbtBase : nbt.getTagList("requiredFluids", 10)) {
-                    NBTTagCompound fluidNbt = (NBTTagCompound) fluidNbtBase;
-                    Fluid fluid = FluidRegistry.getFluid(fluidNbt.getString("FluidName"));
-                    if (fluid != null) {
-                        FluidTask task = new FluidTask(q);
-                        task.fluid = fluid;
-                        task.amount = fluidNbt.getInteger("Amount");
-                        task.fluidNBT = ignoreNBT ? null : fluidNbt.getCompoundTag("Tag");
-                        tasks.add(task);
-                    } else {
-                        FTBQImporter.LOGGER.info("Skipped a non-existing fluid in fluid task for quest {}!", q.title);
+                JsonArray completedQuestsArray = new JsonArray();
+                for (Quest quest : ServerQuestFile.INSTANCE.quests) {
+                    if (teamData.isCompleted(quest)) {
+                        JsonObject questProgress = new JsonObject();
+                        questProgress.addProperty("claimed", teamData.isRewardClaimed(player.getId(), quest.rewards.get(0)));
+                        questProgress.addProperty("questID", quest.id);
+                        completedQuestsArray.add(questProgress);
                     }
                 }
-            } else {
-                FTBQImporter.LOGGER.warn("Skipped an unsupported, non-consuming fluid task for quest {}!", q.title);
-                q.getTags().add(WARNING_TAG);
-            }
+                playerProgress.add("completed", completedQuestsArray);
 
-            if (tasks.isEmpty()) {
-                FTBQImporter.LOGGER.warn("Fluid task for quest {} is empty!", q.title);
-                q.getTags().add(WARNING_TAG);
-            }
-
-            return tasks;
-        });
-    }
-
-    // reward converters
-    static {
-        rewardConverters.put("bq_standard:item", (nbt, q) -> {
-            Collection<Reward> rewards = new HashSet<>();
-            for (NBTBase rewardItem : nbt.getTagList("rewards", 10)) {
-
-                ItemStack item = Utils.nbtItem((NBTTagCompound) rewardItem);
-
-                ItemStack loot_chest = new ItemStack(FTBQuestsItems.LOOTCRATE);
-                loot_chest.setTagInfo("type", new NBTTagString("loot_chest"));
-
-                if (ItemStack.areItemStackTagsEqual(item, loot_chest) && LootImporter.get() != null) {
-                    RandomReward r = new RandomReward(q);
-                    r.table = LootImporter.get().getTable();
-                    rewards.add(r);
-                } else if (!item.isEmpty()) {
-                    rewards.add(new ItemReward(q, item));
+                JsonArray completedTasksArray = new JsonArray();
+                for (Task task : ServerQuestFile.INSTANCE.tasks) {
+                    if (teamData.isCompleted(task)) {
+                        JsonObject taskProgress = new JsonObject();
+                        taskProgress.addProperty("index", task.id);
+                        completedTasksArray.add(taskProgress);
+                    }
                 }
-            }
-            if (rewards.isEmpty()) {
-                FTBQImporter.LOGGER.warn("Item reward for quest {} is empty!", q.title);
-                q.getTags().add(WARNING_TAG);
-            }
-            return rewards;
-        });
+                playerProgress.add("tasks", completedTasksArray);
 
-        rewardConverters.put("bq_standard:choice", (nbt, q) -> {
-            RewardTable table = new RewardTable(q.chapter.file);
-            for (NBTBase rewardItem : nbt.getTagList("choices", 10)) {
-                ItemStack stack = Utils.nbtItem((NBTTagCompound) rewardItem);
-                if (!stack.isEmpty()) {
-                    table.rewards.add(new WeightedReward(new ItemReward(table.fakeQuest, stack), 1));
-                }
+                JsonObject playerProgressWrapper = new JsonObject();
+                playerProgressWrapper.addProperty("uuid", player.getId().toString());
+                playerProgressWrapper.add("questProgress", playerProgress);
+                questProgressArray.add(playerProgressWrapper);
             }
+        }
 
-            if (!table.rewards.isEmpty()) {
-                table.id = table.file.newID();
-                table.file.rewardTables.add(table);
-                table.title = q.title;
+        questProgressJson.add("questProgress", questProgressArray);
 
-                ChoiceReward reward = new ChoiceReward(q);
-                reward.table = table;
-                return Collections.singleton(reward);
-            } else {
-                table.deleteSelf();
-                FTBQImporter.LOGGER.warn("Choice reward for quest {} is empty!", q.title);
-                q.getTags().add(WARNING_TAG);
-                return Collections.emptySet();
-            }
-        });
+        // Save to JSON file
+        DataWriter.save(new File(u.getWorldDirectory(), "exported_progress.json"), questProgressJson);
 
-        rewardConverters.put("bq_standard:xp", (nbt, q) -> {
-            if (nbt.getBoolean("isLevels")) {
-                XPLevelsReward reward = new XPLevelsReward(q);
-                reward.xpLevels = nbt.getInteger("amount");
-                return Collections.singleton(reward);
-            } else {
-                XPReward reward = new XPReward(q);
-                reward.xp = nbt.getInteger("amount");
-                return Collections.singleton(reward);
-            }
-        });
+        sender.sendMessage(new TextComponentString("Finished exporting Progress!"));
+    }
+}
 
-        rewardConverters.put("bq_standard:command", (nbt, q) -> {
-            // TODO: support multiline commands
-            CommandReward reward = new CommandReward(q);
-            reward.command = nbt.getString("command").replace("VAR_NAME", "@p");
-            reward.playerCommand = nbt.getBoolean("viaPlayer");
-            return Collections.singleton(reward);
-        });
+class LootExporter {
+
+    private final ServerQuestFile questFile;
+
+    public LootExporter(ServerQuestFile questFile) {
+        this.questFile = questFile;
     }
 
-    public static ItemStack nbtItem(NBTTagCompound itemNbt) {
-        return nbtItem(itemNbt, false);
-    }
+    public JsonObject exportLoot() {
+        JsonObject lootJson = new JsonObject();
+        JsonArray groupsArray = new JsonArray();
 
-    public static ItemStack nbtItem(NBTTagCompound itemNbt, boolean isFilter) {
-        ItemStack stack = ItemStack.EMPTY;
+        for (RewardTable table : questFile.rewardTables) {
+            if (table.lootCrate != null) {
+                JsonObject groupJson = new JsonObject();
+                groupJson.addProperty("name", table.title);
+                groupJson.addProperty("weight", 1); // Default weight
 
-        if (itemNbt.isEmpty()) {
-            FTBQImporter.LOGGER.debug("Item {} has incorrect format! Returning empty item stack", itemNbt);
-            return stack;
-        }
+                JsonArray rewardsArray = new JsonArray();
+                for (WeightedReward reward : table.rewards) {
+                    if (reward.reward instanceof ItemReward) {
+                        ItemReward itemReward = (ItemReward) reward.reward;
+                        JsonObject rewardJson = new JsonObject();
+                        rewardJson.addProperty("weight", reward.weight);
 
-        String ore = itemNbt.getString("OreDict");
-        if (!ore.isEmpty()) {
-            stack = oreDictItem(ore, isFilter);
-        }
-        itemNbt.removeTag("OreDict");
+                        JsonArray itemsArray = new JsonArray();
+                        JsonObject itemJson = new JsonObject();
+                        NBTTagCompound itemTag = new NBTTagCompound();
+                        itemReward.getItem().writeToNBT(itemTag);
+                        itemJson.addProperty("item", itemTag.toString());
+                        itemsArray.add(itemJson);
 
-        if (!stack.isEmpty()) {
-            return stack;
-        }
-
-        String id = itemNbt.getString("id");
-
-        if (id.isEmpty()) {
-            FTBQImporter.LOGGER.debug("Item ID {} is invalid or empty! Returning empty item stack", id);
-            return stack;
-        } else if (id.equals("betterquesting:placeholder")) {
-            // why fun, why?
-            NBTTagCompound placeholderNbt = itemNbt.copy();
-            placeholderNbt.setString("id", itemNbt.getCompoundTag("tag").getString("orig_id"));
-            placeholderNbt.setInteger("Damage", itemNbt.getCompoundTag("tag").getInteger("orig_meta"));
-            placeholderNbt.setInteger("tag", itemNbt.getCompoundTag("tag").getInteger("orig_tag")); // ew.
-            FTBQImporter.LOGGER.debug("Item was placeholder, trying to retrieve original item with id {}", placeholderNbt.getString("id"));
-            return nbtItem(placeholderNbt, isFilter);
-        } else if (id.equals("bq_standard:loot_chest")) {
-            stack = new ItemStack(FTBQuestsItems.LOOTCRATE);
-            stack.setTagInfo("type", new NBTTagString("loot_chest"));
-            return stack;
-        }
-
-        stack = ItemMissing.read(itemNbt);
-        if (stack.isEmpty() || stack.isItemEqual(new ItemStack(ItemFiltersItems.MISSING))) {
-            FTBQImporter.LOGGER.debug("{} returned an empty or missing item!", itemNbt);
-        } else {
-            FTBQImporter.LOGGER.debug("Found an item with properties {}!", itemNbt);
-        }
-        return stack;
-    }
-
-    public static ItemStack oreDictItem(String ore, boolean isFilter) {
-        if (isFilter) {
-            ItemStack oreFilter = new ItemStack(ItemFiltersItems.FILTER);
-            IItemFilter filter = ItemFiltersAPI.getFilter(oreFilter);
-
-            if (filter instanceof ItemFilter.ItemFilterData) {
-                ItemFilter.ItemFilterData data = (ItemFilter.ItemFilterData) filter;
-                OreDictionaryFilter odFilter = new OreDictionaryFilter();
-                odFilter.setValue(ore);
-                data.filter = odFilter;
-
-                List<ItemStack> valid_items = NonNullList.create();
-                filter.getValidItems(valid_items);
-                if (valid_items.isEmpty()) {
-                    FTBQImporter.LOGGER.debug("Warning: Did not create Ore Dictionary filter with value {} as it is empty!", ore);
-                    return ItemStack.EMPTY;
+                        rewardJson.add("items", itemsArray);
+                        rewardsArray.add(rewardJson);
+                    }
                 }
 
-                FTBQImporter.LOGGER.debug("Successfully created ore dictionary filter with value {}", ore);
-                oreFilter.setStackDisplayName("Any " + ore);
-                return oreFilter;
+                groupJson.add("rewards", rewardsArray);
+                groupsArray.add(groupJson);
             }
-
-            return ItemStack.EMPTY;
-        } else {
-            if (!OreDictionary.doesOreNameExist(ore)) {
-                return ItemStack.EMPTY;
-            }
-            ItemStack stack = OreDictionary.getOres(ore).get(0);
-            if (stack.getMetadata() == OreDictionary.WILDCARD_VALUE) {
-                return new ItemStack(stack.getItem(), 1, 0);
-            }
-            return stack;
         }
+
+        lootJson.add("groups", groupsArray);
+        return lootJson;
+    }
+
+    public NBTTagCompound exportLootToNBT() {
+        JsonObject lootJson = exportLoot();
+        return NBTConverter.JSONtoNBT_Object(lootJson, new NBTTagCompound(), true);
     }
 }
